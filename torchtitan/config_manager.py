@@ -6,11 +6,10 @@
 
 import importlib
 import os
-from pathlib import Path
 import sys
 
 from dataclasses import asdict, dataclass, field, fields, is_dataclass, make_dataclass
-from typing import Any, Literal, Optional, Type
+from typing import Any, Literal, Type
 
 import torch
 import tyro
@@ -103,6 +102,8 @@ class Model:
 
     tokenizer_path: str = "./torchtitan/datasets/tokenizer/tokenizer.model"
     """Tokenizer path"""
+
+    model_config_path: str | None = None
 
     converters: list[str] = field(default_factory=list)
     """
