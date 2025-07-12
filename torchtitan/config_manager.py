@@ -103,6 +103,8 @@ class Model:
     tokenizer_path: str = "./torchtitan/datasets/tokenizer/tokenizer.model"
     """Tokenizer path"""
 
+    model_config_path: str | None = None
+
     converters: list[str] = field(default_factory=list)
     """
     Comma separated list of converters to apply to the model.
@@ -656,6 +658,9 @@ class Experimental:
     needs to ensure that the path can be imported.
     """
 
+@dataclass
+class DebugArgs:
+    debugging_log_folder: str
 
 @dataclass
 class JobConfig:
@@ -681,6 +686,9 @@ class JobConfig:
     memory_estimation: MemoryEstimation = field(default_factory=MemoryEstimation)
     fault_tolerance: FaultTolerance = field(default_factory=FaultTolerance)
     experimental: Experimental = field(default_factory=Experimental)
+    debugging: DebugArgs = None
+
+
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

@@ -6,6 +6,7 @@
 
 import importlib
 import os
+from pathlib import Path
 import time
 from datetime import timedelta
 from typing import Any, Generator, Iterable, Optional
@@ -14,6 +15,7 @@ import torch
 from torch.distributed.elastic.multiprocessing.errors import record
 
 import torchtitan.components.ft as ft
+from torchtitan.models.eurolingua.model_factory import ModelFactory
 import torchtitan.protocols.train_spec as train_spec_module
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.dataloader import DataloaderStopIteration
@@ -328,6 +330,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             f"total steps {job_config.training.steps} "
             f"(warmup {job_config.lr_scheduler.warmup_steps})."
         )
+
+        if job_config.debugging is not None:
+            self.model_parts = [ModelFactory._get_debugging_enriched_model(model_part, logging_dir_path=Path(job_config.debugging.debugging_log_folder)) for model_part in self.model_parts]
+            
 
     def batch_generator(
         self, data_iterable: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
