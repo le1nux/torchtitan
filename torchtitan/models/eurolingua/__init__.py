@@ -18,7 +18,7 @@ from torchtitan.protocols.train_spec import register_train_spec, TrainSpec
 
 
 gpt2_llm_configs = {
-    "debugmodel": GPT2LLMModelArgs(model_config_path="/raid/s3/opengptx/max_lue/repositories/torchtitan/torchtitan/models/eurolingua/configs/model_specification.yaml"),
+    "debugmodel": GPT2LLMModelArgs(),
 }
 
 

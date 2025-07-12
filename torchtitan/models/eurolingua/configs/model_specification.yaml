@@ -36,9 +36,3 @@ lm_head_norm_config:
   config:
     normalized_shape: ${n_embd}
     eps: 1.0e-05
-debugging_args:
-  logging_dir_path: /raid/s3/opengptx/max_lue/repositories/torchtitan/torchtitan/logs
-  tracked_ranks: 
-    - 0
-    - 1
-    - 2
