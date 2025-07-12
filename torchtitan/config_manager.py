@@ -6,10 +6,11 @@
 
 import importlib
 import os
+from pathlib import Path
 import sys
 
 from dataclasses import asdict, dataclass, field, fields, is_dataclass, make_dataclass
-from typing import Any, Literal, Type
+from typing import Any, Literal, Optional, Type
 
 import torch
 import tyro
@@ -656,6 +657,9 @@ class Experimental:
     needs to ensure that the path can be imported.
     """
 
+@dataclass
+class DebugArgs:
+    debugging_log_folder: str
 
 @dataclass
 class JobConfig:
@@ -681,6 +685,9 @@ class JobConfig:
     memory_estimation: MemoryEstimation = field(default_factory=MemoryEstimation)
     fault_tolerance: FaultTolerance = field(default_factory=FaultTolerance)
     experimental: Experimental = field(default_factory=Experimental)
+    debugging: DebugArgs = None
+
+
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)

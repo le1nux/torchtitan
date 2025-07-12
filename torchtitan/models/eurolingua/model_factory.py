@@ -100,14 +100,14 @@ class ModelFactory:
         arg_dict = model_args.__dict__
         debugging_args = arg_dict.pop("debugging_args", None)
         model = GPT2LLM(**arg_dict)
-        if debugging_args is not None:
-            logging_dir_path = debugging_args.logging_dir_path
-            tracked_ranks = set(debugging_args.tracked_ranks)
-            model = ModelFactory._get_debugging_enriched_model(
-                model=model,
-                logging_dir_path=logging_dir_path,
-                tracked_ranks=tracked_ranks,
-            )
+        # if debugging_args is not None:
+        #     logging_dir_path = debugging_args.logging_dir_path
+        #     tracked_ranks = set(debugging_args.tracked_ranks)
+        #     model = ModelFactory._get_debugging_enriched_model(
+        #         model=model,
+        #         logging_dir_path=logging_dir_path,
+        #         tracked_ranks=tracked_ranks,
+        #     )
 
 
         return model
