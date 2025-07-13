@@ -12,6 +12,7 @@ from typing import Any, Optional
 
 from tokenizers import AddedToken, Tokenizer as HfTokenizer
 from typing_extensions import override
+from torchtitan.config_manager import JobConfig
 
 
 class Tokenizer(ABC):
@@ -49,6 +50,7 @@ class HuggingFaceTokenizer(Tokenizer):
         self,
         tokenizer_path: str,
     ):
+        super().__init__()
         self.tokenizer_path = tokenizer_path
 
         # Initialize BOS/EOS token attributes (frequently used)
@@ -68,6 +70,11 @@ class HuggingFaceTokenizer(Tokenizer):
         # Infer special tokens and adding BOS/EOS behavior
         self._infer_special_tokens()
         self._infer_should_add_bos_eos()
+
+
+    @property
+    def n_words(self) -> int:
+        return self.tokenizer.get_vocab_size()
 
     def _load_config(self, config_path: str) -> Optional[dict]:
         """Load configuration from JSON file if it exists."""
@@ -406,7 +413,7 @@ class HuggingFaceTokenizer(Tokenizer):
         return self.tokenizer.id_to_token(token_id)
 
 
-def build_hf_tokenizer(tokenizer_path: str) -> HuggingFaceTokenizer:
+def build_hf_tokenizer(job_config: JobConfig) -> HuggingFaceTokenizer:
     """
     Builds a HuggingFaceTokenizer from the specified path.
 
@@ -421,5 +428,5 @@ def build_hf_tokenizer(tokenizer_path: str) -> HuggingFaceTokenizer:
     Returns:
         tokenizer (HuggingFaceTokenizer): Loaded tokenizer instance with intelligent BOS/EOS handling
     """
-    tokenizer = HuggingFaceTokenizer(tokenizer_path)
+    tokenizer = HuggingFaceTokenizer(job_config.model.tokenizer_path)
     return tokenizer
