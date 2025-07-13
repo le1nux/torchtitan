@@ -1,14 +1,14 @@
 use_weight_tying: false
 sample_key: input_ids
 poe_type: NOPE
-sequence_length: 256
+sequence_length: 4096
 prediction_key: logits
 vocab_size: 50304
-n_layer: 3
+n_layer: 30
 n_head_q: 8
 n_head_kv: 4
-ffn_hidden: 128
-n_embd: 128
+ffn_hidden: 512
+n_embd: 512
 dropout: 0.0
 bias: false
 attention_config:
