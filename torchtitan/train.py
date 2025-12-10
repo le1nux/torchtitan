@@ -610,6 +610,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     @record
     def train(self):
         job_config = self.job_config
+        # rank  = dist.get_rank()
+        # if rank in {0, 1}:
+        #     logging_dir_path = Path(f"/raid/s3/opengptx/max_lue/repositories/torchtitan/outputs/shape_tracking/")
+        #     get_debugging_enriched_model(model=self.model_parts[0], logging_dir_path=logging_dir_path, tracked_ranks={0,1}, log_interval_steps=1)
+
 
         self.checkpointer.load(step=job_config.checkpoint.load_step)
         logger.info(f"Training starts at step {self.step + 1}")
@@ -744,6 +749,202 @@ def main(trainer_class: type[Trainer]) -> None:
         if torch.distributed.is_initialized():
             torch.distributed.destroy_process_group()
         logger.info("Process group destroyed")
+
+
+import torch.nn as nn 
+from pathlib import Path
+from typing import Optional, Set
+from dataclasses import dataclass, asdict
+import torch.distributed as dist
+from functools import partial
+import json
+
+def get_debugging_enriched_model(
+    model: nn.Module, logging_dir_path: Path, tracked_ranks: Optional[Set[int]] = None, log_interval_steps: int = 1
+) -> nn.Module:
+    """
+    Enriches the model with debugging hooks to log tensor statistics during forward and backward passes.
+    During the forward pass, it logs the input and output tensors of each module, as well as the parameters.
+    Similarly, during the backward pass, it logs the gradients of the output tensors.
+
+    The following tensor statistics are logged:
+        - global shape
+        - local shape
+        - is_dtensor (whether the tensor is a DTensor)
+        - nan count
+        - inf count
+        - mean
+        - std
+        - min
+        - max
+    The statistics are written to a JSONL file in the specified logging directory.
+
+    Args:
+        model (nn.Module): The model to be enriched with debugging hooks.
+        logging_dir_path (Path): The directory path where the tensor statistics will be logged.
+        tracked_ranks (Optional[Set[int]]): A set of ranks to track. If provided, only these ranks
+            will log the statistics. If None, all ranks will log the statistics.
+        log_interval_steps (int): The interval in steps at which to log the tensor statistics. Default is 1.
+    """
+
+    @dataclass
+    class TensorStats:
+        """Dataclass to hold tensor statistics."""
+
+        global_shape: list[int]
+        local_shape: list[int]
+        dtype: str
+        is_dtensor: bool
+        nan_count: int
+        inf_count: int
+        mean: float
+        std: float
+        min: float
+        max: float
+
+    @dataclass
+    class CounterRef:
+        """Dataclass to hold a counter reference for tracking the number of hooks called.
+        This is used as a closure to keep track of the number of hooks called."""
+
+        value: int = 0
+
+    rank = dist.get_rank() if dist.is_initialized() else 0
+
+    if tracked_ranks is not None and rank not in tracked_ranks:
+        return model
+    if rank == 0:
+        logging_dir_path.mkdir(parents=True, exist_ok=True)
+    logging_file_path = logging_dir_path / f"tensor_stats_rank_{rank}.jsonl"
+
+    def get_tensor_stats(tensor: torch.Tensor) -> TensorStats:
+        """Get statistics of a tensor."""
+        local_tensor = tensor.to_local() if isinstance(tensor, dist.tensor.DTensor) else tensor
+        float_dtypes = {torch.float, torch.bfloat16}
+        numeric_dtypes = float_dtypes | {torch.int, torch.long}
+
+        dtype = local_tensor.dtype
+        is_float = dtype in float_dtypes
+        is_numeric = dtype in numeric_dtypes
+
+        tensor_stats = TensorStats(
+            global_shape=list(tensor.shape),
+            local_shape=list(local_tensor.shape),
+            dtype=str(dtype),
+            is_dtensor=isinstance(tensor, dist.tensor.DTensor),
+            nan_count=torch.isnan(local_tensor).sum().item(),
+            inf_count=torch.isinf(local_tensor).sum().item(),
+            mean=local_tensor.mean().item() if is_float else -1,
+            std=local_tensor.std().item() if is_float else -1,
+            min=local_tensor.min().item() if is_numeric else -1,
+            max=local_tensor.max().item() if is_numeric else -1,
+        )
+        return tensor_stats
+
+    def write_out_tensor_stats(tensor_stats: TensorStats | None, counter: int, hook_type: str, tensor_tag: str, rank: int, timestamp_ns: int):
+        """Write out tensor statistics to a file."""
+        with open(logging_file_path, "a", encoding="utf-8") as f:
+            if tensor_stats is None:
+                tensor_stats_dict = {
+                    "tensor_tag": tensor_tag,
+                    "hook_type": hook_type,
+                    "counter": counter,
+                    "rank": rank,
+                    "is_none": True,
+                    "timestamp_ns": timestamp_ns,
+                }
+                f.write(json.dumps(tensor_stats_dict) + "\n")
+            else:
+                tensor_stats_dict = asdict(tensor_stats)
+                tensor_stats_dict = {
+                    "tensor_tag": tensor_tag,
+                    "hook_type": hook_type,
+                    **tensor_stats_dict,
+                    "counter": counter,
+                    "rank": rank,
+                    "timestamp_ns": timestamp_ns,
+                }
+
+                f.write(json.dumps(tensor_stats_dict) + "\n")
+
+    def pre_forward_hook(module: nn.Module, forward_input, counter: CounterRef, log_interval_steps: int):
+        timestamp_ns = time.perf_counter_ns()
+        if log_interval_steps > 0 and counter.value % log_interval_steps != 0:
+            counter.value += 1
+            return
+
+        if isinstance(forward_input, tuple):
+            forward_inputs = forward_input
+        else:
+            forward_inputs = (forward_input,)
+
+        for forward_input in forward_inputs:
+            if forward_input is None:
+                write_out_tensor_stats(None, counter.value, "forward_input", module._debug_name, rank, timestamp_ns)
+            else: 
+                tensor_stats = get_tensor_stats(forward_input)
+                write_out_tensor_stats(tensor_stats, counter.value, "forward_input", module._debug_name, rank, timestamp_ns)
+
+        # Retrieves statistics of the module's parameters before forward pass.
+        for name, param in module.named_parameters(recurse=False):
+            tensor_stats = get_tensor_stats(param)
+            full_name = f"{module._debug_name}.{name}"
+            write_out_tensor_stats(
+                tensor_stats=tensor_stats,
+                counter=counter.value,
+                hook_type="forward_weights",
+                tensor_tag=full_name,
+                rank=rank,
+                timestamp_ns=timestamp_ns,
+            )
+        counter.value += 1
+
+    def forward_hook(module: nn.Module, forward_input, forward_output, counter: CounterRef, log_interval_steps: int):
+        timestamp_ns = time.perf_counter_ns()
+        if log_interval_steps > 0 and counter.value % log_interval_steps != 0:
+            counter.value += 1
+            return
+
+        if isinstance(forward_output, tuple):
+            forward_outputs = forward_output
+        else:
+            forward_outputs = (forward_output,)
+
+        for out in forward_outputs:
+            tensor_stats = get_tensor_stats(out)
+            write_out_tensor_stats(tensor_stats, counter.value, "forward_output", module._debug_name, rank, timestamp_ns)
+        counter.value += 1
+
+    def backward_hook(module, grad_input, grad_output, counter: CounterRef, log_interval_steps: int):
+        timestamp_ns = time.perf_counter_ns()
+        if log_interval_steps > 0 and counter.value % log_interval_steps != 0:
+            counter.value += 1
+            return
+
+        for grad_out in grad_output:
+            tensor_stats = get_tensor_stats(grad_out)
+            write_out_tensor_stats(tensor_stats, counter.value, "backward_output", module._debug_name, rank, timestamp_ns)
+        counter.value += 1
+
+    def register_hooks_recursively(module: nn.Module, prefix: str = ""):
+        for name, child in module.named_children():
+            full_name = f"{prefix}.{name}" if prefix else name
+            child._debug_name = full_name
+
+            child.register_forward_pre_hook(
+                partial(pre_forward_hook, counter=CounterRef(), log_interval_steps=log_interval_steps)
+            )
+            child.register_forward_hook(
+                partial(forward_hook, counter=CounterRef(), log_interval_steps=log_interval_steps)
+            )
+            child.register_full_backward_hook(
+                partial(backward_hook, counter=CounterRef(), log_interval_steps=log_interval_steps)
+            )
+            register_hooks_recursively(child, full_name)
+
+    register_hooks_recursively(model)
+
+    return model
 
 
 if __name__ == "__main__":
