@@ -21,9 +21,9 @@ from torchtitan.hf_datasets import DatasetConfig
 from torchtitan.tools.logging import logger
 
 
-def _load_c4_dataset(dataset_path: str, split: str):
+def _load_c4_dataset(dataset_path: str, split: str, streaming: bool = True, cache_dir: str | None = None):
     """Load C4 dataset with default configuration."""
-    return load_dataset(dataset_path, name="en", split=split, streaming=True)
+    return load_dataset(dataset_path, name="en", split=split, streaming=streaming, cache_dir=cache_dir)
 
 
 def _process_c4_text(sample: dict[str, Any]) -> str:
@@ -45,7 +45,12 @@ DATASETS = {
     ),
     "c4_validation": DatasetConfig(
         path="allenai/c4",
-        loader=partial(_load_c4_dataset, split="validation"),
+        loader=partial(_load_c4_dataset, split="validation", streaming=False, cache_dir="./assets/datasets/"),
+        sample_processor=_process_c4_text,
+    ),
+    "benchmarking": DatasetConfig(
+        path="datasets/benchmarking",
+        loader=lambda path: load_dataset(path, split="train"),
         sample_processor=_process_c4_text,
     ),
 }
@@ -225,3 +230,9 @@ def build_text_validation_dataloader(
         dp_world_size=dp_world_size,
         batch_size=batch_size,
     )
+
+
+if __name__ == "__main__":
+    # Simple test to verify dataset loading
+    ds = DATASETS["c4_validation"]
+    dataset = ds.loader(ds.path)
