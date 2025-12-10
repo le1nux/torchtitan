@@ -49,8 +49,8 @@ DATASETS = {
         sample_processor=_process_c4_text,
     ),
     "benchmarking": DatasetConfig(
-        path="datasets/benchmarking",
-        loader=lambda path: load_dataset(path, split="train"),
+        path="soofi/benchmarking",
+        loader=lambda path: load_dataset(path, split="train", streaming=False, cache_dir="/data/"),
         sample_processor=_process_c4_text,
     ),
 }
