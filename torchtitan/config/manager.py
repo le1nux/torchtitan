@@ -45,7 +45,7 @@ class ConfigManager:
 
     def parse_args(self, args: list[str] = sys.argv[1:]) -> JobConfig:
         toml_values = self._maybe_load_toml(args)
-        config_cls = self._maybe_add_custom_args(args, toml_values)
+        config_cls = self._maybe_add_custom_config(args, toml_values)
 
         base_config = (
             self._dict_to_dataclass(config_cls, toml_values)
@@ -83,16 +83,19 @@ class ConfigManager:
             logger.exception(f"Error while loading config file: {file_path}")
             raise e
 
-    def _maybe_add_custom_args(
+    def _maybe_add_custom_config(
         self, args: list[str], toml_values: dict[str, Any] | None
     ) -> Type[JobConfig]:  # noqa: B006
-        """Find and merge custom arguments module with current JobConfig class"""
+        """
+        Find and merge custom config module with current JobConfig class, if it is given.
+        The search order is first searching CLI args, then toml config file.
+        """
         module_path = None
 
         # 1. Check CLI
         valid_keys = {
-            "--experimental.custom_args_module",
-            "--experimental.custom-args-module",
+            "--job.custom_config_module",
+            "--job.custom-config-module",
         }
         for i, arg in enumerate(args):
             key = arg.split("=")[0]
@@ -102,9 +105,9 @@ class ConfigManager:
 
         # 2. If not found in CLI, check TOML
         if not module_path and toml_values:
-            experimental = toml_values.get("experimental", {})
-            if isinstance(experimental, dict):
-                module_path = experimental.get("custom_args_module")
+            job = toml_values.get("job", {})
+            if isinstance(job, dict):
+                module_path = job.get("custom_config_module")
 
         if not module_path:
             return self.config_cls
@@ -159,6 +162,14 @@ class ConfigManager:
         if not is_dataclass(cls):
             return data
 
+        valid_fields = set(f.name for f in fields(cls))
+        if invalid_fields := set(data) - valid_fields:
+            raise ValueError(
+                f"Invalid field names in {cls} data: {invalid_fields}.\n"
+                "Please modify your .toml config file or override these fields from the command line.\n"
+                "Run `NGPU=1 ./run_train.sh --help` to read all valid fields."
+            )
+
         result = {}
         for f in fields(cls):
             if f.name in data:
@@ -170,27 +181,42 @@ class ConfigManager:
         return cls(**result)
 
     def _validate_config(self) -> None:
-        # TODO: temporary mitigation of BC breaking change in
-        #       tokenizer default path, need to remove later
-        if not os.path.exists(self.config.model.tokenizer_path):
+        if self.config.experimental.custom_args_module:
             logger.warning(
-                f"Tokenizer path {self.config.model.tokenizer_path} does not exist!"
+                "This field is being moved to --job.custom_config_module and "
+                "will be deprecated soon. Setting job.custom_config_module to "
+                "experimental.custom_args_module temporarily."
+            )
+            self.config.job.custom_config_module = (
+                self.config.experimental.custom_args_module
+            )
+        # TODO: temporary mitigation of BC breaking change in hf_assets_path
+        #       tokenizer default path, need to remove later
+        if self.config.model.tokenizer_path:
+            logger.warning(
+                "tokenizer_path is deprecated, use model.hf_assets_path instead. "
+                "Setting hf_assets_path to tokenizer_path temporarily."
+            )
+            self.config.model.hf_assets_path = self.config.model.tokenizer_path
+        if not os.path.exists(self.config.model.hf_assets_path):
+            logger.warning(
+                f"HF assets path {self.config.model.hf_assets_path} does not exist!"
             )
             old_tokenizer_path = (
                 "torchtitan/datasets/tokenizer/original/tokenizer.model"
             )
             if os.path.exists(old_tokenizer_path):
-                self.config.model.tokenizer_path = old_tokenizer_path
+                self.config.model.hf_assets_path = old_tokenizer_path
                 logger.warning(
                     f"Temporarily switching to previous default tokenizer path {old_tokenizer_path}. "
-                    "Please download the new tokenizer model (python scripts/download_tokenizer.py) and update your config."
+                    "Please download the new tokenizer files (python scripts/download_hf_assets.py) and update your config."
                 )
         else:
             # Check if we are using tokenizer.model, if so then we need to alert users to redownload the tokenizer
-            if self.config.model.tokenizer_path.endswith("tokenizer.model"):
+            if self.config.model.hf_assets_path.endswith("tokenizer.model"):
                 raise Exception(
                     "You are using the old tokenizer.model, please redownload the tokenizer ",
-                    "(python scripts/download_tokenizer.py --repo_id meta-llama/Llama-3.1-8B) ",
+                    "(python scripts/download_hf_assets.py --repo_id meta-llama/Llama-3.1-8B --assets tokenizer) ",
                     " and update your config to the directory of the downloaded tokenizer.",
                 )
 
@@ -198,7 +224,7 @@ class ConfigManager:
     def register_tyro_rules(registry: tyro.constructors.ConstructorRegistry) -> None:
         @registry.primitive_rule
         def list_str_rule(type_info: tyro.constructors.PrimitiveTypeInfo):
-            """Support for comma seperated string parsing"""
+            """Support for comma separated string parsing"""
             if type_info.type != list[str]:
                 return None
             return tyro.constructors.PrimitiveConstructorSpec(

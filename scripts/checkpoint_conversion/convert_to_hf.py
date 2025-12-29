@@ -12,10 +12,18 @@ import torch.distributed.checkpoint as dcp
 import torchtitan.protocols.train_spec as train_spec_module
 from torch.distributed.checkpoint import HuggingFaceStorageWriter
 from torchtitan.components.checkpoint import ModelWrapper
+from torchtitan.config import TORCH_DTYPE_MAP
 
 
 @torch.inference_mode()
-def convert_to_hf(input_dir, output_dir, model_name, model_flavor):
+def convert_to_hf(
+    input_dir,
+    output_dir,
+    model_name,
+    model_flavor,
+    hf_assets_path,
+    export_dtype,
+):
     # load model and model args so that we can get the state dict shape
     train_spec = train_spec_module.get_train_spec(model_name)
     model_args = train_spec.model_args[model_flavor]
@@ -24,7 +32,7 @@ def convert_to_hf(input_dir, output_dir, model_name, model_flavor):
         model = train_spec.model_cls(model_args)
     model = ModelWrapper(model)
 
-    sd_adapter = train_spec.state_dict_adapter(model_args)
+    sd_adapter = train_spec.state_dict_adapter(model_args, hf_assets_path)
     assert (
         sd_adapter is not None
     ), "trying to convert checkpoint from DCP to HF safetensors format, but sd_adapter is not provided."
@@ -39,20 +47,18 @@ def convert_to_hf(input_dir, output_dir, model_name, model_flavor):
     # convert state dict tt->hf
     hf_state_dict = sd_adapter.to_hf(state_dict)
 
-    fqn_to_index_mapping = {}
-    num_fqns_per_file = 30
-
-    for i, key in enumerate(hf_state_dict.keys()):
-        group_num = (i // num_fqns_per_file) + 1
-        fqn_to_index_mapping[key] = group_num
-
     storage_writer = HuggingFaceStorageWriter(
         path=output_dir,
         save_distributed=True,
-        fqn_to_index_mapping=fqn_to_index_mapping,
+        fqn_to_index_mapping=sd_adapter.fqn_to_index_mapping,
         enable_consolidation=True,
         thread_count_consolidation=5,
     )
+
+    # map and apply export dtype if needed
+    target_dtype = TORCH_DTYPE_MAP[export_dtype]
+    if target_dtype != torch.float32:
+        hf_state_dict = {k: v.to(target_dtype) for k, v in hf_state_dict.items()}
 
     dcp.save(
         hf_state_dict,
@@ -68,8 +74,22 @@ if __name__ == "__main__":
     parser.add_argument(
         "output_dir", type=Path, help="Output directory for HF checkpoint."
     )
+    parser.add_argument(
+        "--hf_assets_path",
+        type=Path,
+        help="Path to HF assets directory. This is used to get the model.safetensors.index.json mapping",
+        default="./assets/hf/Llama-3.1-8B",
+    )
     parser.add_argument("--model_name", type=str, nargs="?", default="llama3")
     parser.add_argument("--model_flavor", type=str, nargs="?", default="8B")
+    parser.add_argument(
+        "--export_dtype",
+        type=str,
+        nargs="?",
+        choices=["float16", "bfloat16", "float32"],
+        default="float32",
+        help="Export dtype for HF checkpoint (default: float32)",
+    )
     args = parser.parse_args()
 
     convert_to_hf(
@@ -77,4 +97,6 @@ if __name__ == "__main__":
         args.output_dir,
         args.model_name,
         args.model_flavor,
+        args.hf_assets_path,
+        args.export_dtype,
     )

@@ -24,9 +24,8 @@ from torch.distributed.tensor.parallel import (
     parallelize_module,
     RowwiseParallel,
 )
-from torchtitan.components.checkpoint import excluded_parameters_for_model_only
 from torchtitan.components.metrics import build_device_memory_monitor
-from torchtitan.config import ConfigManager
+from torchtitan.config import ConfigManager, Debug as DebugConfig
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.protocols.train_spec import get_train_spec
 from torchtitan.tools import utils
@@ -125,6 +124,7 @@ def test_generate(
             tp=world_size,
             pp=1,
             ep=1,
+            etp=1,
             world_size=world_size,
         )
         world_mesh = parallel_dims.world_mesh
@@ -133,7 +133,13 @@ def test_generate(
         # sequences would require https://github.com/pytorch/torchtitan/pull/686
         apply_tp_minus_sp(model, parallel_dims.world_mesh["tp"])
 
-    dist_utils.set_determinism(world_mesh, device, seed, deterministic)
+    debug_config = DebugConfig(seed=seed, deterministic=deterministic)
+    dist_utils.set_determinism(
+        world_mesh=world_mesh,
+        device=device,
+        debug_config=debug_config,
+        distinct_seed_mesh_dims=["pp"],
+    )
 
     # materalize model
     model.to_empty(device=device_type)
@@ -142,8 +148,6 @@ def test_generate(
     model.eval()
 
     state_dict = model.state_dict()
-    for k in excluded_parameters_for_model_only:
-        state_dict.pop(k, None)
 
     # Checkpoint Loading
     begin = time.monotonic()

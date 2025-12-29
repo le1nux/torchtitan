@@ -8,21 +8,22 @@ import importlib
 import os
 import time
 from datetime import timedelta
-from typing import Any, Generator, Iterable, Optional
+from typing import Any, Generator, Iterable
 
 import torch
+
 from torch.distributed.elastic.multiprocessing.errors import record
 
 import torchtitan.protocols.train_spec as train_spec_module
 from torchtitan.components.checkpoint import CheckpointManager
-from torchtitan.components.dataloader import DataloaderStopIteration
+from torchtitan.components.dataloader import DataloaderExhaustedError
 from torchtitan.components.ft import FTManager, maybe_semi_sync_training
 from torchtitan.components.loss import rescale_accumulated_loss
 from torchtitan.components.metrics import (
     build_metrics_processor,
     ensure_pp_loss_visible,
 )
-from torchtitan.config import ConfigManager, JobConfig
+from torchtitan.config import ConfigManager, JobConfig, TORCH_DTYPE_MAP
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.protocols.model_converter import build_model_converters
 from torchtitan.tools import utils
@@ -48,6 +49,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     lr_schedulers: train_spec_module.LRSchedulersContainer
     validator: train_spec_module.BaseValidator
     metrics_processor: train_spec_module.MetricsProcessor
+    model_args: train_spec_module.BaseModelArgs
 
     # non-swappable training components
     checkpointer: CheckpointManager
@@ -77,31 +79,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if job_config.experimental.custom_import:
             importlib.import_module(job_config.experimental.custom_import)
 
-        if job_config.job.print_args:
-            logger.info(f"Running with args: {job_config.to_dict()}")
-
         device_module, device_type = utils.device_module, utils.device_type
         self.device = torch.device(f"{device_type}:{int(os.environ['LOCAL_RANK'])}")
         # Device has to be set before creating TorchFT manager.
         device_module.set_device(self.device)
 
+        job_config.maybe_log()
+
         # init distributed and build meshes
-        dist_utils.init_distributed(
-            job_config.comm,
-            enable_cpu_backend=job_config.training.enable_cpu_offload,
-            base_folder=job_config.job.dump_folder,
-        )
-        world_size = int(os.environ["WORLD_SIZE"])
-        parallelism_config = job_config.parallelism
-        self.parallel_dims = parallel_dims = ParallelDims(
-            dp_shard=parallelism_config.data_parallel_shard_degree,
-            dp_replicate=parallelism_config.data_parallel_replicate_degree,
-            cp=parallelism_config.context_parallel_degree,
-            tp=parallelism_config.tensor_parallel_degree,
-            pp=parallelism_config.pipeline_parallel_degree,
-            ep=parallelism_config.expert_parallel_degree,
-            world_size=world_size,
-        )
+        self.parallel_dims = parallel_dims = self.init_distributed()
 
         world_mesh = parallel_dims.world_mesh
         if parallel_dims.dp_enabled:
@@ -123,8 +109,8 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         dist_utils.set_determinism(
             world_mesh,
             self.device,
-            job_config.training.seed,
-            job_config.training.deterministic,
+            job_config.debug,
+            distinct_seed_mesh_dims=["pp"],
         )
         self.train_spec = train_spec_module.get_train_spec(job_config.model.name)
 
@@ -146,11 +132,15 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         model_args = self.train_spec.model_args[job_config.model.flavor]
         # set the model args from training job configs
         model_args.update_from_config(job_config)
+        self.model_args = model_args
 
         logger.info(
-            f"Building {self.train_spec.name} {job_config.model.flavor} with {model_args}"
+            f"Building {job_config.model.name} {job_config.model.flavor} with {model_args}"
         )
-        with torch.device("meta"):
+        with (
+            torch.device("meta"),
+            utils.set_default_dtype(TORCH_DTYPE_MAP[job_config.training.dtype]),
+        ):
             model = self.train_spec.model_cls(model_args)
 
         # Build the collection of model converters. No-op if `model.converters` empty
@@ -175,7 +165,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         ) = model_args.get_nparams_and_flops(model, job_config.training.seq_len)
 
         logger.info(
-            f"{color.blue}Model {self.train_spec.name} {job_config.model.flavor} "
+            f"{color.blue}Model {job_config.model.name} {job_config.model.flavor} "
             f"{color.red}size: {model_param_count:,} total parameters{color.reset}"
         )
 
@@ -190,7 +180,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             init_device = device_type
             buffer_device = None
 
-        self.loss_fn = self.train_spec.build_loss_fn(job_config)
+        self.loss_fn = self.train_spec.build_loss_fn(
+            job_config, parallel_dims=parallel_dims, ft_manager=self.ft_manager
+        )
 
         # verify batch sizes
         global_batch_size = job_config.training.global_batch_size
@@ -220,7 +212,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         if parallel_dims.pp_enabled:
             if not self.train_spec.pipelining_fn:
                 raise RuntimeError(
-                    f"Pipeline Parallel is enabled but {self.train_spec.name} "
+                    f"Pipeline Parallel is enabled but {job_config.model.name} "
                     f"does not support pipelining"
                 )
 
@@ -291,6 +283,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             )
         )
         self.metrics_processor.optimizers = self.optimizers
+        self.metrics_processor.model_parts = self.model_parts
 
         # Initialize trainer states that will be saved in checkpoint.
         # These attributes must be initialized before checkpoint loading.
@@ -305,7 +298,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             states={"train_state": self},
             checkpoint_config=job_config.checkpoint,
             sd_adapter=(
-                self.train_spec.state_dict_adapter(model_args)
+                self.train_spec.state_dict_adapter(
+                    model_args, job_config.model.hf_assets_path
+                )
                 if self.train_spec.state_dict_adapter
                 else None
             ),
@@ -314,12 +309,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         )
 
         loss_parallel_enabled = (
-            parallel_dims.tp_enabled and not parallelism_config.disable_loss_parallel
+            parallel_dims.tp_enabled
+            and not job_config.parallelism.disable_loss_parallel
         )
-        self.train_context = dist_utils.get_train_context(
-            loss_parallel_enabled,
-            parallelism_config.enable_compiled_autograd,
-        )
+        self.train_context = dist_utils.get_train_context(loss_parallel_enabled)
         self.maybe_enable_amp = dist_utils.maybe_enable_amp(
             parallel_dims,
             job_config.training.mixed_precision_param,
@@ -327,7 +320,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         )
 
         # Build validator if validation is configured
-        if job_config.validation.enabled:
+        if job_config.validation.enable:
             assert self.train_spec.build_validator_fn is not None
 
             pp_schedule, pp_has_first_stage, pp_has_last_stage = (
@@ -346,7 +339,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 dp_rank=dp_rank,
                 tokenizer=self.tokenizer,
                 parallel_dims=parallel_dims,
-                loss_fn=self.train_spec.build_loss_fn(job_config),
+                loss_fn=self.loss_fn,
                 validation_context=self.train_context,
                 maybe_enable_amp=self.maybe_enable_amp,
                 metrics_processor=self.metrics_processor,
@@ -365,6 +358,28 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             f"(warmup {job_config.lr_scheduler.warmup_steps})"
         )
 
+    def init_distributed(self) -> ParallelDims:
+        job_config = self.job_config
+        dist_utils.init_distributed(
+            job_config.comm,
+            enable_cpu_backend=job_config.training.enable_cpu_offload,
+            base_folder=job_config.job.dump_folder,
+        )
+
+        world_size = int(os.environ["WORLD_SIZE"])
+        parallelism_config = job_config.parallelism
+
+        return ParallelDims(
+            dp_shard=parallelism_config.data_parallel_shard_degree,
+            dp_replicate=parallelism_config.data_parallel_replicate_degree,
+            cp=parallelism_config.context_parallel_degree,
+            tp=parallelism_config.tensor_parallel_degree,
+            pp=parallelism_config.pipeline_parallel_degree,
+            ep=parallelism_config.expert_parallel_degree,
+            etp=parallelism_config.expert_tensor_parallel_degree,
+            world_size=world_size,
+        )
+
     def batch_generator(
         self, data_iterable: Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]
     ) -> Iterable[tuple[dict[str, torch.Tensor], torch.Tensor]]:
@@ -379,7 +394,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             except StopIteration as ex:
                 # If data runs out during gradient accumulation, that
                 # entire step will not be executed.
-                raise DataloaderStopIteration() from ex
+                raise DataloaderExhaustedError() from ex
             input_dict, labels = batch
             ntokens_batch = labels.numel()
             self.ntokens_seen += ntokens_batch
@@ -396,20 +411,80 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
             yield input_dict, labels
 
+    def post_dataloading_process(
+        self, input_dict: dict[str, torch.Tensor], labels: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor], dict[str, Any]]:
+        """
+        Post-processing hook after data loading and before model forward pass.
+
+        This method processes the raw data from the dataloader and prepares it for
+        the model's forward pass. It separates the main input tensor from auxiliary
+        inputs and constructs additional keyword arguments (e.g., attention masks).
+
+        This method can be overridden in subclasses to customize data processing
+        for different training strategies (e.g., converting tensors to DTensors,
+        applying custom transformations, etc.).
+
+        Args:
+            input_dict: Dictionary containing tensors from the dataloader. Must
+                contain an "input" key with the main input tensor. May contain
+                additional keys for auxiliary inputs (e.g., position ids).
+            labels: Target labels for the batch.
+
+        Returns:
+            A tuple of (inputs, labels, extra_inputs, extra_kwargs) where:
+                - inputs: Main input tensor extracted from input_dict["input"].
+                - labels: Target labels (unchanged from input parameter).
+                - extra_inputs: Dict of auxiliary input tensors (all keys except
+                    "input" from input_dict). These are passed to the model forward
+                    but are NOT forwarded across pipeline parallel stages.
+                - extra_kwargs: Dict of additional keyword arguments for model forward.
+                    These ARE forwarded across pipeline parallel stages. Contains
+                    attention_masks if flex attention is enabled.
+
+        Note:
+            The distinction between extra_inputs and extra_kwargs is important for
+            pipeline parallelism: extra_kwargs are forwarded to all pipeline stages,
+            while extra_inputs are only available to the first stage.
+        """
+        inputs = input_dict["input"]
+        extra_inputs = {k: v for k, v in input_dict.items() if k != "input"}
+        # For arguments, like attention_masks, we have to put them in a separate
+        # dict as extra_inputs are not forwarded to other stages in PP, but
+        # extra_kwargs are.
+        extra_kwargs: dict[str, Any] = {}
+
+        if getattr(self.model_args, "use_flex_attn", False):
+            extra_kwargs["attention_masks"] = self.model_parts[0].get_attention_masks(
+                input_batch=inputs,
+                tokenizer=self.tokenizer,
+                extra_inputs=extra_inputs,
+            )
+
+        return inputs, labels, extra_inputs, extra_kwargs
+
     def forward_backward_step(
         self, input_dict: dict[str, torch.Tensor], labels: torch.Tensor
     ) -> torch.Tensor:
         model_parts = self.model_parts
         parallel_dims = self.parallel_dims
 
+        inputs, labels, extra_inputs, extra_kwargs = self.post_dataloading_process(
+            input_dict, labels
+        )
         # apply context parallelism if cp is enabled
         # ensure CP handles the separate freqs_cis buffer for each pp stage
-        inputs = input_dict["input"]
+        cp_buffers = [inputs, labels]
+        cp_seq_dims = [1, 1]
+        if hasattr(model_parts[0], "freqs_cis"):
+            cp_buffers += [m.freqs_cis for m in model_parts]
+            cp_seq_dims += [0 for _ in model_parts]
+
         optional_context_parallel_ctx = (
             dist_utils.create_context_parallel_ctx(
                 cp_mesh=parallel_dims.world_mesh["cp"],
-                cp_buffers=[inputs, labels] + [m.freqs_cis for m in model_parts],
-                cp_seq_dims=[1, 1] + [0 for _ in model_parts],
+                cp_buffers=cp_buffers,
+                cp_seq_dims=cp_seq_dims,
                 cp_no_restore_buffers={inputs, labels},
                 cp_rotate_method=self.job_config.parallelism.context_parallel_rotate_method,
             )
@@ -425,17 +500,28 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 )
                 if self.pp_has_first_stage:
                     self.pp_schedule.step(
-                        inputs, target=targets, losses=losses, input_batch=inputs
+                        inputs,
+                        **extra_inputs,
+                        **extra_kwargs,
+                        target=targets,
+                        losses=losses,
+                        return_outputs=False,
                     )
                 else:
                     self.pp_schedule.step(
-                        target=targets, losses=losses, input_batch=inputs
+                        **extra_kwargs,
+                        target=targets,
+                        losses=losses,
+                        return_outputs=False,
                     )
 
             # accumulate losses across pipeline microbatches
             # TODO: PP+FSDP unexpectedly puts the loss back to the CPU
             loss = (
-                torch.mean(torch.stack(losses)).to(self.device)
+                # using sum instead of mean because we already rescale the
+                # loss_fn down by a factor of n_microbatches in
+                # torchtitan/distributed/pipeline_parallel.py
+                torch.sum(torch.stack(losses)).to(self.device)
                 if self.pp_has_last_stage
                 else torch.tensor([-1.0], device=self.device)
             )
@@ -444,9 +530,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             with self.train_context(optional_context_parallel_ctx):
                 assert len(model_parts) == 1
                 with self.maybe_enable_amp:
-                    pred = model_parts[0](inputs, eos_id=self.tokenizer.eos_id)
+                    pred = model_parts[0](inputs, **extra_inputs, **extra_kwargs)
                     loss = self.loss_fn(pred, labels)
-                # need to free to before bwd to avoid peaking memory
+                # need to free pred before bwd to avoid peaking memory
                 del pred
                 loss.backward()
 
@@ -466,7 +552,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         accumulated_losses = []
         # If data runs out during gradient accumulation, that
         # entire step will not be executed.
-        for microbatch in range(self.gradient_accumulation_steps):
+        for _microbatch in range(self.gradient_accumulation_steps):
             input_dict, labels = next(data_iterator)
             loss = self.forward_backward_step(input_dict, labels)
             accumulated_losses.append(loss.detach())
@@ -478,11 +564,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             pp_mesh=(
                 parallel_dims.world_mesh["pp"] if parallel_dims.pp_enabled else None
             ),
-            ep_dense_params_mesh_ndim=(
-                parallel_dims.dense_params_mesh_ndim
-                if parallel_dims.ep_enabled
-                else None
-            ),
+            ep_enabled=parallel_dims.ep_enabled,
         )
         self.checkpointer.maybe_wait_for_staging()
         self.optimizers.step()
@@ -528,6 +610,11 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
     @record
     def train(self):
         job_config = self.job_config
+        # rank  = dist.get_rank()
+        # if rank in {0, 1}:
+        #     logging_dir_path = Path(f"/raid/s3/opengptx/max_lue/repositories/torchtitan/outputs/shape_tracking/")
+        #     get_debugging_enriched_model(model=self.model_parts[0], logging_dir_path=logging_dir_path, tracked_ranks={0,1}, log_interval_steps=1)
+
 
         self.checkpointer.load(step=job_config.checkpoint.load_step)
         logger.info(f"Training starts at step {self.step + 1}")
@@ -553,30 +640,41 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             maybe_semi_sync_training(
                 job_config.fault_tolerance,
                 ft_manager=self.ft_manager,
-                model_parts=self.model_parts,
+                model=self.model_parts[0],
+                n_layers=(
+                    self.model_args.n_layers
+                    if hasattr(self.model_args, "n_layers")
+                    else 0
+                ),
                 optimizer=self.optimizers,
+                fragment_fn=(
+                    self.train_spec.fragment_fn
+                    if hasattr(self.train_spec, "fragment_fn")
+                    else None
+                ),
             ),
         ):
             data_iterator = self.batch_generator(self.dataloader)
-            while self.step < job_config.training.steps:
+            while self.should_continue_training():
                 self.step += 1
                 self.gc_handler.run(self.step)
                 try:
                     self.train_step(data_iterator)
-                except DataloaderStopIteration:
+                except DataloaderExhaustedError:
                     logger.warning("Ran out of data; last step was canceled.")
                     break
-
-                # Run validation if validator is available
-                if (
-                    self.job_config.validation.enabled
-                    and self.validator.should_validate(self.step)
-                ):
-                    self.validator.validate(self.model_parts, self.step)
 
                 self.checkpointer.save(
                     self.step, last_step=(self.step == job_config.training.steps)
                 )
+
+                # Run validation if validator is available
+                if (
+                    self.job_config.validation.enable
+                    and self.validator.should_validate(self.step)
+                ):
+                    with self.loss_fn.no_rescale():
+                        self.validator.validate(self.model_parts, self.step)
 
                 # signal the profiler that the next profiling step has started
                 if torch_profiler:
@@ -600,6 +698,9 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
 
         logger.info("Training completed")
 
+    def should_continue_training(self) -> bool:
+        return self.step < self.job_config.training.steps
+
     def state_dict(self) -> dict[str, Any]:
         return {"step": self.step, "ntokens_seen": self.ntokens_seen}
 
@@ -608,27 +709,32 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.ntokens_seen = state_dict["ntokens_seen"]
 
     def close(self) -> None:
-        if self.checkpointer:
+        if hasattr(self, "checkpointer") and self.checkpointer:
             self.checkpointer.close()
-        if self.metrics_processor:
+        if hasattr(self, "metrics_processor") and self.metrics_processor:
             self.metrics_processor.close()
 
 
-if __name__ == "__main__":
+def main(trainer_class: type[Trainer]) -> None:
+    """Main entry point for training with a specified trainer class.
+
+    Args:
+        trainer_class: The trainer class to instantiate (e.g., Trainer, FluxTrainer, TorchCommsTrainer)
+    """
     init_logger()
     config_manager = ConfigManager()
     config = config_manager.parse_args()
-    trainer: Optional[Trainer] = None
+    trainer: Trainer | None = None
 
     try:
-        trainer = Trainer(config)
+        trainer = trainer_class(config)
 
         if config.checkpoint.create_seed_checkpoint:
             assert (
                 int(os.environ["WORLD_SIZE"]) == 1
             ), "Must create seed checkpoint using a single device, to disable sharding."
             assert (
-                config.checkpoint.enable_checkpoint
+                config.checkpoint.enable
             ), "Must enable checkpointing when creating a seed checkpoint."
             trainer.checkpointer.save(curr_step=0, last_step=True)
             logger.info("Created seed checkpoint")
@@ -640,5 +746,206 @@ if __name__ == "__main__":
         raise
     else:
         trainer.close()
-        torch.distributed.destroy_process_group()
+        if torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
         logger.info("Process group destroyed")
+
+
+import torch.nn as nn 
+from pathlib import Path
+from typing import Optional, Set
+from dataclasses import dataclass, asdict
+import torch.distributed as dist
+from functools import partial
+import json
+
+def get_debugging_enriched_model(
+    model: nn.Module, logging_dir_path: Path, tracked_ranks: Optional[Set[int]] = None, log_interval_steps: int = 1
+) -> nn.Module:
+    """
+    Enriches the model with debugging hooks to log tensor statistics during forward and backward passes.
+    During the forward pass, it logs the input and output tensors of each module, as well as the parameters.
+    Similarly, during the backward pass, it logs the gradients of the output tensors.
+
+    The following tensor statistics are logged:
+        - global shape
+        - local shape
+        - is_dtensor (whether the tensor is a DTensor)
+        - nan count
+        - inf count
+        - mean
+        - std
+        - min
+        - max
+    The statistics are written to a JSONL file in the specified logging directory.
+
+    Args:
+        model (nn.Module): The model to be enriched with debugging hooks.
+        logging_dir_path (Path): The directory path where the tensor statistics will be logged.
+        tracked_ranks (Optional[Set[int]]): A set of ranks to track. If provided, only these ranks
+            will log the statistics. If None, all ranks will log the statistics.
+        log_interval_steps (int): The interval in steps at which to log the tensor statistics. Default is 1.
+    """
+
+    @dataclass
+    class TensorStats:
+        """Dataclass to hold tensor statistics."""
+
+        global_shape: list[int]
+        local_shape: list[int]
+        dtype: str
+        is_dtensor: bool
+        nan_count: int
+        inf_count: int
+        mean: float
+        std: float
+        min: float
+        max: float
+
+    @dataclass
+    class CounterRef:
+        """Dataclass to hold a counter reference for tracking the number of hooks called.
+        This is used as a closure to keep track of the number of hooks called."""
+
+        value: int = 0
+
+    rank = dist.get_rank() if dist.is_initialized() else 0
+
+    if tracked_ranks is not None and rank not in tracked_ranks:
+        return model
+    if rank == 0:
+        logging_dir_path.mkdir(parents=True, exist_ok=True)
+    logging_file_path = logging_dir_path / f"tensor_stats_rank_{rank}.jsonl"
+
+    def get_tensor_stats(tensor: torch.Tensor) -> TensorStats:
+        """Get statistics of a tensor."""
+        local_tensor = tensor.to_local() if isinstance(tensor, dist.tensor.DTensor) else tensor
+        float_dtypes = {torch.float, torch.bfloat16}
+        numeric_dtypes = float_dtypes | {torch.int, torch.long}
+
+        dtype = local_tensor.dtype
+        is_float = dtype in float_dtypes
+        is_numeric = dtype in numeric_dtypes
+
+        tensor_stats = TensorStats(
+            global_shape=list(tensor.shape),
+            local_shape=list(local_tensor.shape),
+            dtype=str(dtype),
+            is_dtensor=isinstance(tensor, dist.tensor.DTensor),
+            nan_count=torch.isnan(local_tensor).sum().item(),
+            inf_count=torch.isinf(local_tensor).sum().item(),
+            mean=local_tensor.mean().item() if is_float else -1,
+            std=local_tensor.std().item() if is_float else -1,
+            min=local_tensor.min().item() if is_numeric else -1,
+            max=local_tensor.max().item() if is_numeric else -1,
+        )
+        return tensor_stats
+
+    def write_out_tensor_stats(tensor_stats: TensorStats | None, counter: int, hook_type: str, tensor_tag: str, rank: int, timestamp_ns: int):
+        """Write out tensor statistics to a file."""
+        with open(logging_file_path, "a", encoding="utf-8") as f:
+            if tensor_stats is None:
+                tensor_stats_dict = {
+                    "tensor_tag": tensor_tag,
+                    "hook_type": hook_type,
+                    "counter": counter,
+                    "rank": rank,
+                    "is_none": True,
+                    "timestamp_ns": timestamp_ns,
+                }
+                f.write(json.dumps(tensor_stats_dict) + "\n")
+            else:
+                tensor_stats_dict = asdict(tensor_stats)
+                tensor_stats_dict = {
+                    "tensor_tag": tensor_tag,
+                    "hook_type": hook_type,
+                    **tensor_stats_dict,
+                    "counter": counter,
+                    "rank": rank,
+                    "timestamp_ns": timestamp_ns,
+                }
+
+                f.write(json.dumps(tensor_stats_dict) + "\n")
+
+    def pre_forward_hook(module: nn.Module, forward_input, counter: CounterRef, log_interval_steps: int):
+        timestamp_ns = time.perf_counter_ns()
+        if log_interval_steps > 0 and counter.value % log_interval_steps != 0:
+            counter.value += 1
+            return
+
+        if isinstance(forward_input, tuple):
+            forward_inputs = forward_input
+        else:
+            forward_inputs = (forward_input,)
+
+        for forward_input in forward_inputs:
+            if forward_input is None:
+                write_out_tensor_stats(None, counter.value, "forward_input", module._debug_name, rank, timestamp_ns)
+            else: 
+                tensor_stats = get_tensor_stats(forward_input)
+                write_out_tensor_stats(tensor_stats, counter.value, "forward_input", module._debug_name, rank, timestamp_ns)
+
+        # Retrieves statistics of the module's parameters before forward pass.
+        for name, param in module.named_parameters(recurse=False):
+            tensor_stats = get_tensor_stats(param)
+            full_name = f"{module._debug_name}.{name}"
+            write_out_tensor_stats(
+                tensor_stats=tensor_stats,
+                counter=counter.value,
+                hook_type="forward_weights",
+                tensor_tag=full_name,
+                rank=rank,
+                timestamp_ns=timestamp_ns,
+            )
+        counter.value += 1
+
+    def forward_hook(module: nn.Module, forward_input, forward_output, counter: CounterRef, log_interval_steps: int):
+        timestamp_ns = time.perf_counter_ns()
+        if log_interval_steps > 0 and counter.value % log_interval_steps != 0:
+            counter.value += 1
+            return
+
+        if isinstance(forward_output, tuple):
+            forward_outputs = forward_output
+        else:
+            forward_outputs = (forward_output,)
+
+        for out in forward_outputs:
+            tensor_stats = get_tensor_stats(out)
+            write_out_tensor_stats(tensor_stats, counter.value, "forward_output", module._debug_name, rank, timestamp_ns)
+        counter.value += 1
+
+    def backward_hook(module, grad_input, grad_output, counter: CounterRef, log_interval_steps: int):
+        timestamp_ns = time.perf_counter_ns()
+        if log_interval_steps > 0 and counter.value % log_interval_steps != 0:
+            counter.value += 1
+            return
+
+        for grad_out in grad_output:
+            tensor_stats = get_tensor_stats(grad_out)
+            write_out_tensor_stats(tensor_stats, counter.value, "backward_output", module._debug_name, rank, timestamp_ns)
+        counter.value += 1
+
+    def register_hooks_recursively(module: nn.Module, prefix: str = ""):
+        for name, child in module.named_children():
+            full_name = f"{prefix}.{name}" if prefix else name
+            child._debug_name = full_name
+
+            child.register_forward_pre_hook(
+                partial(pre_forward_hook, counter=CounterRef(), log_interval_steps=log_interval_steps)
+            )
+            child.register_forward_hook(
+                partial(forward_hook, counter=CounterRef(), log_interval_steps=log_interval_steps)
+            )
+            child.register_full_backward_hook(
+                partial(backward_hook, counter=CounterRef(), log_interval_steps=log_interval_steps)
+            )
+            register_hooks_recursively(child, full_name)
+
+    register_hooks_recursively(model)
+
+    return model
+
+
+if __name__ == "__main__":
+    main(Trainer)

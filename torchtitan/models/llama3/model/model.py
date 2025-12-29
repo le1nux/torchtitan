@@ -6,18 +6,33 @@
 #
 # Copyright (c) Meta Platforms, Inc. All Rights Reserved.
 
+import math
 
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.nn.attention.flex_attention import and_masks, BlockMask
 
-from torchtitan.models.attention import build_attention, init_attention_mask
+from torchtitan.components.tokenizer import BaseTokenizer
+from torchtitan.models.attention import (
+    create_attention_mask,
+    FlexAttentionWrapper,
+    get_causal_mask_mod,
+    get_document_mask_mod,
+    ScaledDotProductAttentionWrapper,
+)
+from torchtitan.protocols.model import AttentionMasksType
 from torchtitan.protocols.train_spec import ModelProtocol
 
-from .args import TransformerModelArgs
+from .args import RoPEScalingArgs, TransformerModelArgs
 
 
-def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Tensor:
+def precompute_freqs_cis(
+    dim: int,
+    end: int,
+    theta: float = 10000.0,
+    scaling_args: RoPEScalingArgs = RoPEScalingArgs(),
+) -> torch.Tensor:
     """
     Precompute the frequency tensor for complex exponentials (cis) with given dimensions.
 
@@ -29,11 +44,41 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> torch.Te
         dim (int): Dimension of the frequency tensor.
         end (int): End index for precomputing frequencies.
         theta (float | None): Scaling factor for frequency computation. Defaults to 10000.0.
-
+        scaling_args (RoPEScalingArgs | None): RoPE scaling arguments. Defaults to None.
+            scaling_factor (float): RoPE scaling multiplier; larger values
+                stretch positions to support longer contexts. Defaults to 8.0.
+            low_freq_factor (float): Extra scaling applied to the low-frequency
+                (long-wavelength) RoPE bands. Defaults to 1.0.
+            high_freq_factor (float): Extra scaling applied to the high-frequency
+                (short-wavelength) RoPE bands. Defaults to 4.0.
+            original_max_position_embeddings (int): Maximum position embeddings
+                for original model. Defaults to 8192.
     Returns:
         torch.Tensor: Precomputed frequency tensor with complex exponentials.
     """
     freqs = 1.0 / (theta ** (torch.arange(0, dim, 2)[: (dim // 2)].float() / dim))
+
+    # apply rope scaling
+    scaling_factor = scaling_args.scaling_factor
+    low_freq_factor = scaling_args.low_freq_factor
+    high_freq_factor = scaling_args.high_freq_factor
+    original_max_position_embeddings = scaling_args.original_max_position_embeddings
+    wavelen = 2 * math.pi / freqs
+    high_freq_wavelen = original_max_position_embeddings / high_freq_factor
+    low_freq_wavelen = original_max_position_embeddings / low_freq_factor
+    # wavelen < high_freq_wavelen: do nothing
+    # wavelen > low_freq_wavelen: divide by scaling factor
+    freqs = torch.where(wavelen > low_freq_wavelen, freqs / scaling_factor, freqs)
+    # wavelen in between: linear interpolation of the scaled freqs and the original freqs
+    smooth_factor = (original_max_position_embeddings / wavelen - low_freq_factor) / (
+        high_freq_factor - low_freq_factor
+    )
+    smoothed_freqs = (
+        1 - smooth_factor
+    ) * freqs / scaling_factor + smooth_factor * freqs
+    is_medium_freqs = ~(wavelen < high_freq_wavelen) * ~(wavelen > low_freq_wavelen)
+    freqs = torch.where(is_medium_freqs, smoothed_freqs, freqs)
+
     t = torch.arange(end, device=freqs.device)
     freqs = torch.outer(t, freqs).float()
     freqs_cis = torch.polar(torch.ones_like(freqs), freqs)  # complex64
@@ -145,17 +190,23 @@ class Attention(nn.Module):
         self.wo = nn.Linear(
             model_args.n_heads * self.head_dim, model_args.dim, bias=False
         )
-        self.sdpa = build_attention(model_args.use_flex_attn, model_args.attn_mask_type)
+
+        self.use_flex_attn = model_args.use_flex_attn
+        if self.use_flex_attn:
+            self.inner_attention = FlexAttentionWrapper()
+        else:
+            self.inner_attention = ScaledDotProductAttentionWrapper()
 
     def init_weights(self, init_std: float):
         for linear in (self.wq, self.wk, self.wv):
-            nn.init.trunc_normal_(linear.weight, mean=0.0, std=0.02)
-        nn.init.trunc_normal_(self.wo.weight, mean=0.0, std=init_std)
+            nn.init.normal_(linear.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.wo.weight, mean=0.0, std=init_std)
 
     def forward(
         self,
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
+        attention_masks: AttentionMasksType | None,
     ):
         """
         Forward pass of the attention module.
@@ -189,7 +240,16 @@ class Attention(nn.Module):
         xk = keys.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
         xv = values.transpose(1, 2)  # (bs, n_local_heads, seqlen, head_dim)
 
-        output = self.sdpa(xq, xk, xv)
+        assert (
+            isinstance(attention_masks, BlockMask) or attention_masks is None
+        ), attention_masks
+
+        if self.use_flex_attn:
+            assert isinstance(attention_masks, BlockMask), attention_masks
+            output = self.inner_attention(xq, xk, xv, block_mask=attention_masks)
+        else:
+            assert attention_masks is None
+            output = self.inner_attention(xq, xk, xv)
 
         output = output.transpose(
             1, 2
@@ -237,9 +297,9 @@ class FeedForward(nn.Module):
         return self.w2(F.silu(self.w1(x)) * self.w3(x))
 
     def init_weights(self, init_std: float):
-        nn.init.trunc_normal_(self.w1.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.w1.weight, mean=0.0, std=0.02)
         for linear in (self.w2, self.w3):
-            nn.init.trunc_normal_(linear.weight, mean=0.0, std=init_std)
+            nn.init.normal_(linear.weight, mean=0.0, std=init_std)
 
 
 class TransformerBlock(nn.Module):
@@ -285,6 +345,7 @@ class TransformerBlock(nn.Module):
         self,
         x: torch.Tensor,
         freqs_cis: torch.Tensor,
+        attention_masks: AttentionMasksType | None,
     ):
         """
         Perform a forward pass through the TransformerBlock.
@@ -297,7 +358,7 @@ class TransformerBlock(nn.Module):
             torch.Tensor: Output tensor after applying attention and feedforward layers.
 
         """
-        h = x + self.attention(self.attention_norm(x), freqs_cis)
+        h = x + self.attention(self.attention_norm(x), freqs_cis, attention_masks)
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
 
@@ -335,21 +396,15 @@ class Transformer(nn.Module, ModelProtocol):
 
         self.tok_embeddings = nn.Embedding(model_args.vocab_size, model_args.dim)
 
-        # TODO persistent should be set to false, since this buffer can be recomputed.
-        # however, we set it to true for 2 reasons.  (1) due to pytorch/pytorch#123411,
-        # compile or pipeline-tracer will not correctly handle non-persistent buffers,
-        # so we need to fix that.  (2) if we initialize pipeline-parallel models from
-        # a seed checkpoint rather than calling init_weights, we need freqs_cis to be
-        # initialized by the checkpoint, or we need to add a separate initializer for
-        # just the non-persistent buffers that is called after loading checkpoints.
-        self.register_buffer("freqs_cis", self._precompute_freqs_cis(), persistent=True)
+        self.register_buffer(
+            "freqs_cis", self._precompute_freqs_cis(), persistent=False
+        )
 
         self.layers = torch.nn.ModuleDict()
         for layer_id in range(model_args.n_layers):
             self.layers[str(layer_id)] = TransformerBlock(layer_id, model_args)
         self.norm = nn.RMSNorm(model_args.dim, eps=model_args.norm_eps)
         self.output = nn.Linear(model_args.dim, model_args.vocab_size, bias=False)
-        self.init_weights()
 
     def init_weights(
         self,
@@ -370,7 +425,7 @@ class Transformer(nn.Module, ModelProtocol):
         with torch.device(buffer_device):
             self.freqs_cis = self._precompute_freqs_cis()
         if self.tok_embeddings is not None:
-            nn.init.normal_(self.tok_embeddings.weight)
+            nn.init.normal_(self.tok_embeddings.weight, std=0.02)
         for layer in self.layers.values():
             if layer is not None:
                 layer.init_weights()
@@ -379,12 +434,12 @@ class Transformer(nn.Module, ModelProtocol):
         final_out_std = self.model_args.dim**-0.5
         cutoff_factor = 3
         if self.output is not None:
-            nn.init.trunc_normal_(
+            nn.init.normal_(
                 self.output.weight,
                 mean=0.0,
-                std=final_out_std,
-                a=-cutoff_factor * final_out_std,
-                b=cutoff_factor * final_out_std,
+                std=0.02, # final_out_std,
+                # a=-cutoff_factor * final_out_std,
+                # b=cutoff_factor * final_out_std,
             )
 
     def _precompute_freqs_cis(self) -> torch.Tensor:
@@ -395,13 +450,34 @@ class Transformer(nn.Module, ModelProtocol):
             # relaxing in our CP enablement PR
             self.model_args.max_seq_len,
             self.model_args.rope_theta,
+            self.model_args.rope_scaling_args,
+        )
+
+    def get_attention_masks(
+        self,
+        input_batch: torch.Tensor,
+        tokenizer: BaseTokenizer,
+        extra_inputs: dict[str, torch.Tensor] | None = None,
+    ) -> AttentionMasksType:
+        mask_mods = [get_causal_mask_mod()]
+        match self.model_args.attn_mask_type:
+            case "causal":
+                B = 1
+            case "block_causal":
+                B = input_batch.shape[0]
+                mask_mods.append(get_document_mask_mod(input_batch, tokenizer.eos_id))
+            case _:
+                raise ValueError(
+                    f"Unknown attention mask type: {self.model_args.attn_mask_type}"
+                )
+        return create_attention_mask(
+            and_masks(*mask_mods), B, None, input_batch.shape[1], input_batch.shape[1]
         )
 
     def forward(
         self,
         tokens: torch.Tensor,
-        eos_id: int | None = None,
-        input_batch: torch.Tensor | None = None,
+        attention_masks: AttentionMasksType | None = None,
     ):
         """
         Perform a forward pass through the Transformer model.
@@ -411,25 +487,16 @@ class Transformer(nn.Module, ModelProtocol):
                 If pipeline parallelism is enabled, this will be the input token indices
                 for the ranks on the first pipeline stage. This will be the activation of the
                 previous pipeline stage if the current rank is not on the first stage.
-            input_batch (torch.Tensor): The input batch read from the dataloader.
-                This will always be the input batch regardless of the pipeline stage.
-                This field is required for non-first PP stages to perform document
-                masking attention (to analyze the boundary of the document).
 
         Returns:
             torch.Tensor: Output logits after applying the Transformer model.
 
         """
-        if self.model_args.use_flex_attn:
-            init_attention_mask(
-                input_batch if input_batch is not None else tokens, eos_id=eos_id
-            )
-
         # passthrough for nonexistent layers, allows easy configuration of pipeline parallel stages
         h = self.tok_embeddings(tokens) if self.tok_embeddings else tokens
 
         for layer in self.layers.values():
-            h = layer(h, self.freqs_cis)
+            h = layer(h, self.freqs_cis, attention_masks=attention_masks)
 
         h = self.norm(h) if self.norm else h
         output = self.output(h) if self.output else h

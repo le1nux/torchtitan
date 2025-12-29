@@ -13,6 +13,8 @@ from torch.distributed.elastic.multiprocessing.errors import record
 import torchtitan.protocols.train_spec as train_spec_module
 from torchtitan.components.checkpoint import CheckpointManager
 from torchtitan.components.loss import rescale_accumulated_loss
+from torchtitan.config import TORCH_DTYPE_MAP
+
 from torchtitan.distributed import ParallelDims, utils as dist_utils
 from torchtitan.protocols import BaseModelArgs
 from torchtitan.tools import utils
@@ -80,6 +82,7 @@ class ForgeEngine(torch.distributed.checkpoint.stateful.Stateful):
             tp=parallelism_config.tensor_parallel_degree,
             pp=parallelism_config.pipeline_parallel_degree,
             ep=parallelism_config.expert_parallel_degree,
+            etp=parallelism_config.expert_tensor_parallel_degree,
             world_size=world_size,
         )
 
@@ -101,8 +104,7 @@ class ForgeEngine(torch.distributed.checkpoint.stateful.Stateful):
         dist_utils.set_determinism(
             world_mesh,
             self.device,
-            job_config.training.seed,
-            job_config.training.deterministic,
+            job_config.debug,
         )
         self.train_spec = get_train_spec(job_config.model.name)
 
@@ -113,7 +115,10 @@ class ForgeEngine(torch.distributed.checkpoint.stateful.Stateful):
         # set the model args from training job configs
         model_args.update_from_config(job_config)
 
-        with torch.device("meta"):
+        with (
+            torch.device("meta"),
+            utils.set_default_dtype(TORCH_DTYPE_MAP[job_config.training.dtype]),
+        ):
             model = self.train_spec.model_cls(model_args)
 
         # calculate model size and flops per token
@@ -161,7 +166,7 @@ class ForgeEngine(torch.distributed.checkpoint.stateful.Stateful):
         if parallel_dims.pp_enabled:
             if not self.train_spec.pipelining_fn:
                 raise RuntimeError(
-                    f"Pipeline Parallel is enabled but {self.train_spec.name} "
+                    f"Pipeline Parallel is enabled but {job_config.model.name} "
                     f"does not support pipelining"
                 )
 
@@ -216,7 +221,9 @@ class ForgeEngine(torch.distributed.checkpoint.stateful.Stateful):
             states={"train_state": self},
             checkpoint_config=job_config.checkpoint,
             sd_adapter=(
-                self.train_spec.state_dict_adapter(model_args)
+                self.train_spec.state_dict_adapter(
+                    model_args, job_config.model.hf_assets_path
+                )
                 if self.train_spec.state_dict_adapter
                 else None
             ),
@@ -225,10 +232,7 @@ class ForgeEngine(torch.distributed.checkpoint.stateful.Stateful):
         loss_parallel_enabled = (
             parallel_dims.tp_enabled and not parallelism_config.disable_loss_parallel
         )
-        self.train_context = dist_utils.get_train_context(
-            loss_parallel_enabled,
-            parallelism_config.enable_compiled_autograd,
-        )
+        self.train_context = dist_utils.get_train_context(loss_parallel_enabled)
         self.maybe_enable_amp = dist_utils.maybe_enable_amp(
             parallel_dims,
             job_config.training.mixed_precision_param,

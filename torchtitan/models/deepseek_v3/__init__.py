@@ -3,43 +3,46 @@
 #
 # This source code is licensed under the BSD-style license found in the
 # LICENSE file in the root directory of this source tree.
-#
-# Copyright (c) Meta Platforms, Inc. All Rights Reserved.
 
 from torchtitan.components.loss import build_cross_entropy_loss
 from torchtitan.components.lr_scheduler import build_lr_schedulers
+from torchtitan.components.optimizer import build_optimizers_with_moe_load_balancing
 from torchtitan.components.tokenizer import build_hf_tokenizer
-from torchtitan.datasets.hf_datasets import build_hf_dataloader
-from torchtitan.experiments.llama4.optimizer import build_llama4_optimizers
-from torchtitan.models.llama3.infra.pipeline import pipeline_llama
-
-from torchtitan.protocols.train_spec import register_train_spec, TrainSpec
+from torchtitan.distributed.pipeline_parallel import pipeline_llm
+from torchtitan.hf_datasets.text_datasets import build_text_dataloader
+from torchtitan.models.moe import MoEArgs
+from torchtitan.protocols.train_spec import TrainSpec
 
 from .infra.parallelize import parallelize_deepseekv3
 from .model.args import DeepSeekV3ModelArgs
 from .model.model import DeepSeekV3Model
+from .model.state_dict_adapter import DeepSeekV3StateDictAdapter
 
 __all__ = [
     "parallelize_deepseekv3",
     "DeepSeekV3ModelArgs",
     "DeepSeekV3Model",
-    "deepseekv3_configs",
+    "deepseekv3_args",
 ]
 
 
-deepseekv3_configs = {
+deepseekv3_args = {
     "debugmodel": DeepSeekV3ModelArgs(
-        vocab_size=2000,
+        vocab_size=2048,
         dim=256,
         inter_dim=1024,
         moe_inter_dim=256,
-        n_layers=3,
+        n_layers=6,
         n_dense_layers=1,
         n_heads=16,
-        n_routed_experts=8,
-        n_shared_experts=2,
-        n_activated_experts=3,
-        route_scale=1.0,
+        moe_args=MoEArgs(
+            num_experts=8,
+            num_shared_experts=2,
+            top_k=3,
+            score_func="softmax",
+            route_norm=False,
+            score_before_experts=False,
+        ),
         q_lora_rank=0,
         kv_lora_rank=512,
         qk_nope_head_dim=128,
@@ -48,17 +51,21 @@ deepseekv3_configs = {
         mscale=0.70,
     ),
     "debugmodel_flex_attn": DeepSeekV3ModelArgs(
-        vocab_size=2000,
+        vocab_size=2048,
         dim=256,
         inter_dim=1024,
         moe_inter_dim=256,
-        n_layers=3,
+        n_layers=6,
         n_dense_layers=1,
         n_heads=16,
-        n_routed_experts=8,
-        n_shared_experts=2,
-        n_activated_experts=3,
-        route_scale=1.0,
+        moe_args=MoEArgs(
+            num_experts=8,
+            num_shared_experts=2,
+            top_k=3,
+            score_func="softmax",
+            route_norm=False,
+            score_before_experts=False,
+        ),
         q_lora_rank=0,
         kv_lora_rank=512,
         qk_nope_head_dim=128,
@@ -76,16 +83,22 @@ deepseekv3_configs = {
         n_layers=27,
         n_dense_layers=1,
         n_heads=16,
-        n_routed_experts=64,
-        n_shared_experts=2,
-        n_activated_experts=6,
-        route_scale=1.0,
+        moe_args=MoEArgs(
+            num_experts=64,
+            num_shared_experts=2,
+            top_k=6,
+            score_func="softmax",
+            route_norm=False,
+            score_before_experts=False,
+        ),
         q_lora_rank=0,
         kv_lora_rank=512,
         qk_nope_head_dim=128,
         qk_rope_head_dim=64,
         v_head_dim=128,
         mscale=0.70,
+        use_flex_attn=True,
+        attn_mask_type="block_causal",
     ),
     "236B": DeepSeekV3ModelArgs(
         vocab_size=102400,
@@ -95,17 +108,24 @@ deepseekv3_configs = {
         n_layers=60,
         n_dense_layers=1,
         n_heads=128,
-        n_routed_experts=160,
-        n_shared_experts=2,
-        n_activated_experts=6,
+        moe_args=MoEArgs(
+            num_experts=160,
+            num_shared_experts=2,
+            top_k=6,
+            score_func="softmax",
+            route_norm=False,
+            route_scale=16.0,
+            score_before_experts=False,
+        ),
         n_expert_groups=8,
         n_limited_groups=3,
-        route_scale=16.0,
         q_lora_rank=1536,
         kv_lora_rank=512,
         qk_nope_head_dim=128,
         qk_rope_head_dim=64,
         v_head_dim=128,
+        use_flex_attn=True,
+        attn_mask_type="block_causal",
     ),
     "671B": DeepSeekV3ModelArgs(
         vocab_size=129280,
@@ -115,34 +135,38 @@ deepseekv3_configs = {
         n_layers=61,
         n_dense_layers=3,
         n_heads=128,
-        n_routed_experts=256,
-        n_shared_experts=1,
-        n_activated_experts=8,
+        moe_args=MoEArgs(
+            num_experts=256,
+            num_shared_experts=1,
+            top_k=8,
+            score_func="sigmoid",
+            route_norm=True,
+            route_scale=2.5,
+            score_before_experts=False,
+        ),
         n_expert_groups=8,
         n_limited_groups=4,
-        route_scale=2.5,
-        score_func="sigmoid",
         q_lora_rank=1536,
         kv_lora_rank=512,
         qk_nope_head_dim=128,
         qk_rope_head_dim=64,
         v_head_dim=128,
-        dtype="fp8",
+        use_flex_attn=True,
+        attn_mask_type="block_causal",
     ),
 }
 
 
-register_train_spec(
-    TrainSpec(
-        name="deepseek_v3",
+def get_train_spec() -> TrainSpec:
+    return TrainSpec(
         model_cls=DeepSeekV3Model,
-        model_args=deepseekv3_configs,
+        model_args=deepseekv3_args,
         parallelize_fn=parallelize_deepseekv3,
-        pipelining_fn=pipeline_llama,
-        build_optimizers_fn=build_llama4_optimizers,  # use optimizer hooks to update expert weights
+        pipelining_fn=pipeline_llm,
+        build_optimizers_fn=build_optimizers_with_moe_load_balancing,
         build_lr_schedulers_fn=build_lr_schedulers,
-        build_dataloader_fn=build_hf_dataloader,
+        build_dataloader_fn=build_text_dataloader,
         build_tokenizer_fn=build_hf_tokenizer,
         build_loss_fn=build_cross_entropy_loss,
+        state_dict_adapter=DeepSeekV3StateDictAdapter,
     )
-)

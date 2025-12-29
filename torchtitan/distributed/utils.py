@@ -16,11 +16,9 @@ import torch.distributed.distributed_c10d as c10d
 from torch import distributed as dist
 from torch.distributed.device_mesh import DeviceMesh
 from torch.distributed.tensor import DTensor
-from torch.nn.attention import SDPBackend
 
-from torchtitan.config import Comm as CommConfig, TORCH_DTYPE_MAP
+from torchtitan.config import Comm as CommConfig, Debug as DebugConfig, TORCH_DTYPE_MAP
 from torchtitan.distributed.parallel_dims import ParallelDims
-from torchtitan.models.attention import ScaledDotProductAttention
 from torchtitan.tools.logging import logger
 from torchtitan.tools.utils import device_module, device_type
 
@@ -85,29 +83,47 @@ def dist_mean(
 def set_determinism(
     world_mesh: DeviceMesh | None,
     device: torch.device,
-    seed: int | None = None,
-    deterministic: bool = False,
-    distinct_seed_mesh_dim: str = "pp",
+    debug_config: DebugConfig,
+    distinct_seed_mesh_dims: list[str],
 ) -> None:
     """
     Set the same DTensor manual seed for all dimensions in world mesh, but only different seeds
-    across dimension denoted by `distinct_seed_mesh_dim`. An example use case is pipeline parallelism,
+    across dimensions denoted by `distinct_seed_mesh_dims`. An example use case is pipeline parallelism,
     where we want to have the same seed across SPMD groups, but different seeds across PP groups.
 
     Currently, does not set seeds for the CUDA RNG since TorchTitan always uses DTensor for SPMD parallelisms,
     and DTensor manages its own RNG tracker, but we could extend to support both if needed.
 
     Set Determinism flags for increased reproducibility with loss of performance.
+
+    Args:
+        world_mesh: Device mesh for distributed training
+        device: Device to use
+        distinct_seed_mesh_dims: List of mesh dimension names to have distinct seeds across.
+        seed: Base seed value (if None, will be determined automatically)
+        deterministic: Whether to enable deterministic algorithms
     """
-    if deterministic:
+    if debug_config.deterministic:
         logger.info("Deterministic algorithm enabled (expect perf degradation).")
         torch.use_deterministic_algorithms(True)
+        torch.use_deterministic_algorithms(
+            True, warn_only=debug_config.deterministic_warn_only
+        )
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
         # env var for deterministic CuBLAS
         # https://pytorch.org/docs/stable/generated/torch.use_deterministic_algorithms.html
         os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
+        # Ensure flex_attention is compiled without max-autotune. This is needed to ensure
+        # reproducibility, since the autotune results may not be deterministic.
+        from torch.nn.attention.flex_attention import flex_attention
+
+        from torchtitan.models.attention import FlexAttentionWrapper
+
+        FlexAttentionWrapper._compiled_flex_attn = torch.compile(flex_attention)
+
+    seed = debug_config.seed
     if not world_mesh:
         if seed is not None:
             torch.manual_seed(seed)
@@ -124,28 +140,45 @@ def set_determinism(
         torch.distributed.broadcast(seed_tensor, src=0)
         seed = seed_tensor.to("cpu").view(torch.uint64).item()
 
-    # Set distinct seed for each rank in mesh dimensions, with dimension name provdied by `distinct_seed_mesh_dim`
+    # Set distinct seed for each rank in mesh dimensions, with dimension names provided by `distinct_seed_mesh_dims`
     # For PP + SPMD cases, we want to separate the world into the SPMD mesh and the PP mesh,
     # and choose a unique seed for each rank on the PP mesh.
-    # TODO(jianiw): We could further extend this to support mutiple distinct dimensions instead of just one.
-    if (
-        c10d.get_world_size() > 1
-        and distinct_seed_mesh_dim in world_mesh.mesh_dim_names
-    ):
-        distinct_mesh = world_mesh[distinct_seed_mesh_dim]
-        seed += distinct_mesh.get_local_rank()
+    # We support multiple distinct dimensions by adding each distinct dimension's local rank to the seed.
+    distinct_dims_in_mesh = [
+        dim
+        for dim in distinct_seed_mesh_dims
+        if world_mesh.mesh_dim_names and dim in world_mesh.mesh_dim_names
+    ]
+
+    if c10d.get_world_size() > 1 and distinct_dims_in_mesh:
+        # Each dimension contributes: local_rank * (product of all previous dimension sizes)
+        # This guarantees uniqueness like multi-dimensional array indexing
+        seed_offset = 0
+        cumulative_size = 1
+
+        for dim in distinct_dims_in_mesh:
+            distinct_mesh = world_mesh[dim]
+            local_rank = distinct_mesh.get_local_rank()
+            # Add contribution from this dimension
+            seed_offset += local_rank * cumulative_size
+            # Update cumulative size for next dimension
+            cumulative_size *= distinct_mesh.size()
+
+        seed += seed_offset
         seed %= 2**64
 
         logger.debug(
-            f"{distinct_seed_mesh_dim} rank {distinct_mesh.get_local_rank()}, Global rank {c10d.get_rank()} using seed: {seed}"
+            f"Distinct dims {distinct_dims_in_mesh}, Global rank {c10d.get_rank()} using seed: {seed}"
         )
-        duplicate_seed_mesh = list(
-            filter(
-                lambda name: name != distinct_seed_mesh_dim, world_mesh.mesh_dim_names
-            )
-        )
+
+        # Filter out all distinct dimensions to get duplicate_seed_mesh
+        duplicate_seed_mesh_dims = [
+            name
+            for name in world_mesh.mesh_dim_names
+            if name not in distinct_dims_in_mesh
+        ]
         duplicate_seed_mesh = (
-            world_mesh[duplicate_seed_mesh] if len(duplicate_seed_mesh) else None
+            world_mesh[duplicate_seed_mesh_dims] if duplicate_seed_mesh_dims else None
         )
     else:
         duplicate_seed_mesh = world_mesh
@@ -187,26 +220,14 @@ def create_context_parallel_ctx(
     )
 
 
-def get_train_context(
-    enable_loss_parallel: bool, enable_compiled_autograd: bool
-) -> Generator[None, None, None]:
+def get_train_context(enable_loss_parallel: bool) -> Generator[None, None, None]:
     @contextlib.contextmanager
     def context(cp_context: Generator[None, None, None] | None = None):
         with contextlib.ExitStack() as stack:
             if enable_loss_parallel:
                 stack.enter_context(torch.distributed.tensor.parallel.loss_parallel())
 
-            if enable_compiled_autograd:
-                stack.enter_context(
-                    torch._dynamo.utils.maybe_enable_compiled_autograd(True)
-                )
-
-            if cp_context is not None:
-                if SDPBackend.MATH in ScaledDotProductAttention.backends:
-                    ScaledDotProductAttention.backends.remove(SDPBackend.MATH)
-                assert (
-                    ScaledDotProductAttention.backends
-                ), "No valid SDPA backends with CP."
+            if cp_context:
                 stack.enter_context(cp_context)
 
             yield
@@ -238,7 +259,10 @@ def maybe_enable_amp(
 
 
 def init_distributed(
-    comm_config: CommConfig, enable_cpu_backend: bool = False, base_folder: str = ""
+    comm_config: CommConfig,
+    enable_cpu_backend: bool = False,
+    base_folder: str = "",
+    ranks: list[int] | None = None,
 ):
     def _warn_overwrite_env(env, val):
         if env in os.environ:
@@ -258,7 +282,7 @@ def init_distributed(
         return backend
 
     TRACE_BUFFER_SIZE = "TORCH_FR_BUFFER_SIZE"
-    TRACE_FILE = "TORCH_NCCL_DEBUG_INFO_TEMP_FILE"
+    TRACE_FILE = "TORCH_FR_DUMP_TEMP_FILE"
     DUMP_ON_TIMEOUT = "TORCH_NCCL_DUMP_ON_TIMEOUT"
     ASYNC_ERROR_HANDLING = "TORCH_NCCL_ASYNC_ERROR_HANDLING"
     SKIP_CLEANUP = "3"
@@ -275,12 +299,14 @@ def init_distributed(
         # dump on timeout by default if trace buffer is enabled
         _warn_overwrite_env(DUMP_ON_TIMEOUT, "1")
         dump_dir = os.path.join(base_folder, comm_config.save_traces_folder)
+        prefix = comm_config.save_traces_file_prefix
         os.makedirs(dump_dir, exist_ok=True)
-        _warn_overwrite_env(TRACE_FILE, f"{dump_dir}/rank_")
+        _warn_overwrite_env(TRACE_FILE, f"{dump_dir}/{prefix}")
 
     torch.distributed.init_process_group(
         backend=_get_distributed_backend(enable_cpu_backend),
         timeout=timedelta(seconds=comm_config.init_timeout_seconds),
+        _ranks=ranks if ranks is not None else [],
     )
 
 
@@ -319,7 +345,7 @@ def clip_grad_norm_(
     error_if_nonfinite: bool = False,
     foreach: bool | None = None,
     pp_mesh: DeviceMesh | None = None,
-    ep_dense_params_mesh_ndim: int | None = None,
+    ep_enabled: bool = False,
 ) -> torch.Tensor:
     """
     Clip the gradient norm of an iterable of parameters.
@@ -349,7 +375,7 @@ def clip_grad_norm_(
         Total norm of the parameter gradients (viewed as a single vector).
 
     """
-    if ep_dense_params_mesh_ndim is not None:
+    if ep_enabled:
         return _clip_grad_norm_with_ep(
             parameters,
             max_norm,
@@ -357,7 +383,6 @@ def clip_grad_norm_(
             error_if_nonfinite,
             foreach,
             pp_mesh,
-            ep_dense_params_mesh_ndim,
         )
 
     if isinstance(parameters, torch.Tensor):
@@ -401,7 +426,6 @@ def _clip_grad_norm_with_ep(
     error_if_nonfinite: bool,
     foreach: bool | None,
     pp_mesh: DeviceMesh | None,
-    dense_params_mesh_ndim: int,
 ) -> torch.Tensor:
     ep_params = []
     non_ep_params = []
@@ -412,15 +436,20 @@ def _clip_grad_norm_with_ep(
         if p.grad is None:
             continue
         assert isinstance(p, DTensor) and isinstance(p.grad, DTensor)
-        if p.device_mesh.ndim == dense_params_mesh_ndim:
-            non_ep_params.append(p)
-            non_ep_grads.append(p.grad)
-        else:
+        if "ep" in p.device_mesh.mesh_dim_names:
             ep_params.append(p)
             ep_grads.append(p.grad)
+        else:
+            non_ep_params.append(p)
+            non_ep_grads.append(p.grad)
     ep_grads_total_norm = torch.nn.utils.get_total_norm(
         ep_grads, norm_type, error_if_nonfinite, foreach
-    ).full_tensor()
+    )
+    # ep_grads may be an empty list, in which case get_total_norm returns tensor(0.), a non-DTensor
+    # This can occur in PP + EP setups where certain PP ranks only own non-EP layers, for instance.
+    if isinstance(ep_grads_total_norm, DTensor):
+        ep_grads_total_norm = ep_grads_total_norm.full_tensor()
+
     non_ep_grads_total_norm = torch.nn.utils.get_total_norm(
         non_ep_grads, norm_type, error_if_nonfinite, foreach
     ).full_tensor()

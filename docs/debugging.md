@@ -37,19 +37,19 @@ You can override it at runtime via CLI with:
 To inspect how configuration values are interpreted—including those from `.toml` files and CLI overrides—run the config manager directly:
 
 ```bash
-python -m torchtitan.config_manager [your cli args...]
+python -m torchtitan.config.manager [your cli args...]
 ```
 
 For example,
 
 ```bash
-python -m torchtitan.config_manager --job.config_file ./torchtitan/models/llama3/train_configs/llama3_8b.toml --profiling.enable_memory_snapshot
+python -m torchtitan.config.manager --job.config_file ./torchtitan/models/llama3/train_configs/llama3_8b.toml --profiling.enable_memory_snapshot
 ```
 
 To list all available CLI flags and usage:
 
 ```bash
-python -m torchtitan.config_manager --help
+python -m torchtitan.config.manager --help
 ```
 
 This will print a structured configuration to `stdout`, allowing you to verify that overrides are being applied correctly.
@@ -70,7 +70,7 @@ When debugging issues with multi-dimensional parallelism (combinations of FSDP, 
 Set consistent random seeds across all parallelism dimensions:
 
 ```bash
-CONFIG_FILE="./torchtitan/models/llama3/train_configs/debug_model.toml" ./run_train.sh --training.seed 42
+CONFIG_FILE="./torchtitan/models/llama3/train_configs/debug_model.toml" ./run_train.sh --debug.seed 42
 ```
 
 **Seed behavior with parallelism:**
@@ -84,7 +84,7 @@ CONFIG_FILE="./torchtitan/models/llama3/train_configs/debug_model.toml" ./run_tr
 Enable deterministic algorithms to ensure bit-for-bit reproducibility across runs:
 
 ```bash
-CONFIG_FILE="./torchtitan/models/llama3/train_configs/debug_model.toml" ./run_train.sh --training.deterministic
+CONFIG_FILE="./torchtitan/models/llama3/train_configs/debug_model.toml" ./run_train.sh --debug.deterministic
 ```
 
 **What it does:**
@@ -93,15 +93,41 @@ CONFIG_FILE="./torchtitan/models/llama3/train_configs/debug_model.toml" ./run_tr
 - Sets deterministic workspace configuration for CuBLAS operations
 - **Note:** This will significantly reduce training performance but ensures exact reproducibility
 
+Use `--debug.deterministic_warn_only` to only warn about (not stop running) kernel without deterministic implementation.
+
+### Activation Checkipointing Debugging ###
+
+The following debug configs are available for AC.
+
+`preserve_rng_state` - if deterministic output compared to non-checkpointed passes is required, set to true. Results in stashing and restoring the RNG state during each checkpoint, may be slower.
+
+`determinism_check` - A string specifying the determinism function
+
+`debug` - capture ac debug information. Will be slower.
+
+See https://docs.pytorch.org/docs/stable/checkpoint.html for details.
 
 ### Seed-Checkpoint-based Reproducibility
 
 For multiple experimental runs with different parallelism configs, we need to use a "seed" checkpoint to ensure model initializations are the same across runs. This is because in `torchtitan/train.py`, the model parameters are sharded first, and then have their weights initialized on each rank separately. As a result, it is not equivalent to initialize the model on one rank and then shard it. Using a seed checkpoint helps different runs load the same model weights from checkpoint -- DCP resharding will make sure the loaded weights are sharded correctly according to the parallelism configs.
 
+#### Creating a Seed Checkpoint
 
 ```bash
-NGPU=1 CONFIG_FILE="./torchtitan/models/llama3/train_configs/debug_model.toml" ./run_train.sh --checkpoint.enable_checkpoint --checkpoint.create_seed_checkpoint --parallelism.data_parallel_replicate_degree 1 --parallelism.data_parallel_shard_degree 1 --parallelism.tensor_parallel_degree 1 --parallelism.pipeline_parallel_degree 1 --parallelism.context_parallel_degree 1 --parallelism.expert_parallel_degree 1
+NGPU=1 CONFIG_FILE="./torchtitan/models/llama3/train_configs/debug_model.toml" ./run_train.sh --checkpoint.enable --checkpoint.create_seed_checkpoint --parallelism.data_parallel_replicate_degree 1 --parallelism.data_parallel_shard_degree 1 --parallelism.tensor_parallel_degree 1 --parallelism.pipeline_parallel_degree 1 --parallelism.context_parallel_degree 1 --parallelism.expert_parallel_degree 1
 ```
+
+#### Loading Seed Checkpoints for Debugging
+
+When using seed checkpoints for debugging or validation purposes, you can enable the `load_only` configuration to load checkpoints without saving any new ones during training. This is particularly useful when you only want to verify model correctness or compare different configurations without cluttering your disk:
+
+```bash
+CONFIG_FILE="./torchtitan/models/llama3/train_configs/debug_model.toml" ./run_train.sh --checkpoint.enable --checkpoint.load_only
+```
+
+The `--checkpoint.load_only` flag prevents the training process from saving any checkpoints, allowing you to:
+- Run debugging sessions without generating unwanted checkpoint files
+- Compare model behaviors using the same initial weights without checkpoint overhead
 
 **Note**: Using a seed checkpoint will only make sure a model has same initial weights when configs change, but the training process may not be the same even after setting the seed and the `deterministic` mode, e.g. due to tensor shape change, data precision change, usage of randomness in model code, etc.
 
@@ -116,4 +142,4 @@ Here's a typical comparison setup (maintaining an overall DP degree of 4):
 
 To reproduce loss curves across above runs, you'll need to create a seed checkpoint, and then load the same seed checkpoint for all runs to ensure consistent model initialization on each rank. You might also need to set the `deterministic` mode to ensure consistent training behavior.
 
-We also provided an example of verifying the numerical consistency across parallism plans configs on Llama 3 in https://github.com/pytorch/torchtitan/blob/main/docs/converging.md.
+We also provided an example of verifying the numerical consistency across parallelism plans configs on Llama 3 in https://github.com/pytorch/torchtitan/blob/main/docs/converging.md.
