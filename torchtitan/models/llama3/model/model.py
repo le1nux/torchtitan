@@ -437,7 +437,7 @@ class Transformer(nn.Module, ModelProtocol):
             nn.init.normal_(
                 self.output.weight,
                 mean=0.0,
-                std=final_out_std,
+                std=0.02, # final_out_std,
                 # a=-cutoff_factor * final_out_std,
                 # b=cutoff_factor * final_out_std,
             )
