@@ -48,8 +48,13 @@ DATASETS = {
         loader=partial(_load_c4_dataset, split="validation", streaming=False, cache_dir="./assets/datasets/"),
         sample_processor=_process_c4_text,
     ),
-    "benchmarking": DatasetConfig(
+    "soofi_benchmarking": DatasetConfig(
         path="/data/soofi/benchmarking",
+        loader=lambda path: load_dataset(path, split="train", streaming=False, cache_dir="/data/"),
+        sample_processor=_process_c4_text,
+    ),
+    "soofi_training": DatasetConfig(
+        path="/data/soofi/training",
         loader=lambda path: load_dataset(path, split="train", streaming=False, cache_dir="/data/"),
         sample_processor=_process_c4_text,
     ),
